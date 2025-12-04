@@ -2,270 +2,317 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
-import time
 
-# ---------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------
-st.set_page_config(page_title="Fuzzy MADM – SAW & WP", layout="wide")
-st.title("Sistem Pendukung Keputusan – SAW & WP (Single File Version)")
+# ==============================================
+# CONFIGURASI AWAL
+# ==============================================
 
-# DATA AWAL (sesuai perhitungan manual Anda)
-DEFAULT_DATA = pd.DataFrame({
-    "kode":["A1","A2","A3","A4","A5"],
-    "nama":["Bluehost","Dreamhost","Siteground","Inmotion","HostGator"],
-    "C1":[2,2,4,1,2],
-    "C2":[2,4,1,2,2],
-    "C3":[1,2,1,4,1],
-    "C4":[2,2,1,4,2],
-    "C5":[4,4,4,4,4]
-})
+st.set_page_config(page_title="Sistem Keputusan Fuzzy SAW & WP", layout="wide")
+st.title("Sistem Keputusan – Fuzzy + SAW & WP")
+
+# ==============================================
+# DATA AWAL (Diambil dari PDF Penghitungan Manual)
+# ==============================================
+
+@st.cache_data
+def load_default_data():
+    df = pd.DataFrame({
+        "kode": ["A1","A2","A3","A4","A5"],
+        "nama": ["Bluehost","Dreamhost","Siteground","Inmotion","HostGator"],
+        "C1": [2,2,4,1,2],   # Harga
+        "C2": [2,4,1,2,2],   # Website
+        "C3": [1,2,1,4,1],   # Storage
+        "C4": [2,2,1,4,2],   # Pengunjung
+        "C5": [4,4,4,4,4],   # Domain
+    })
+    return df
 
 CRITERIA = {
-    "C1":{"name":"Harga", "type":"cost",    "weight":0.30},
-    "C2":{"name":"Website", "type":"benefit","weight":0.25},
-    "C3":{"name":"Storage", "type":"benefit","weight":0.15},
-    "C4":{"name":"Pengunjung", "type":"benefit","weight":0.20},
-    "C5":{"name":"Domain", "type":"benefit","weight":0.10},
+    "C1": {"name": "Harga",       "type": "cost",    "weight": 0.30},
+    "C2": {"name": "Website",     "type": "benefit", "weight": 0.25},
+    "C3": {"name": "Storage",     "type": "benefit", "weight": 0.15},
+    "C4": {"name": "Pengunjung",  "type": "benefit", "weight": 0.20},
+    "C5": {"name": "Domain",      "type": "benefit", "weight": 0.10},
 }
 
 CRIT_KEYS = list(CRITERIA.keys())
 
-# ---------------------------------------------------------
-# Set session state
-# ---------------------------------------------------------
+# ==============================================
+# SESSION STATE
+# ==============================================
+
 if "df" not in st.session_state:
-    st.session_state.df = DEFAULT_DATA.copy()
+    st.session_state.df = load_default_data().copy()
 
 if "weights" not in st.session_state:
-    st.session_state.weights = {c:CRITERIA[c]["weight"] for c in CRITERIA}
+    st.session_state.weights = {c: CRITERIA[c]["weight"] for c in CRITERIA}
 
-# ---------------------------------------------------------
-# Sidebar Menu
-# ---------------------------------------------------------
-st.sidebar.header("Menu")
-page = st.sidebar.radio("Pilih Halaman", 
-    ["Home","Input Data","SAW","WP","Perbandingan","Tentang"])
-
-# EDIT BOBOT DI SIDEBAR
-st.sidebar.markdown("### Bobot Kriteria")
-
-new_weights = {}
-for c in CRITERIA:
-    new_weights[c] = st.sidebar.slider(
-        f"{c} – {CRITERIA[c]['name']}", 
-        0.0, 1.0, st.session_state.weights[c], 0.01
-    )
-
-# Normalisasi bobot
-total_w = sum(new_weights.values())
-if total_w == 0:
-    st.sidebar.error("Total bobot = 0, menggunakan bobot default.")
-    st.session_state.weights = {c:CRITERIA[c]["weight"] for c in CRITERIA}
-else:
-    st.session_state.weights = {c:(new_weights[c]/total_w) for c in new_weights}
+if "last_results" not in st.session_state:
+    st.session_state.last_results = None
 
 
-# ---------------------------------------------------------
-# FUNGSI SAW
-# ---------------------------------------------------------
-def calc_saw(df, criteria):
-    dfX = df[CRIT_KEYS].astype(float)
-    norm = dfX.copy()
+# ==============================================
+# FUZZY (TRIANGULAR FUZZY + CENTROID)
+# ==============================================
 
-    # normalisasi
+TFN = {
+    1: (0, 0, 1),
+    2: (0, 1, 2),
+    3: (1, 2, 3),
+    4: (2, 3, 4),
+    5: (3, 4, 4),
+}
+
+def fuzzify_value(v):
+    v = int(v)
+    return TFN[v]
+
+def fuzzify_dataframe(df):
+    cols = CRIT_KEYS
+    fuzzy_parts = []
+    for c in cols:
+        fuzzy_col = df[c].apply(lambda x: fuzzify_value(x))
+        fuzzy_df = pd.DataFrame(fuzzy_col.tolist(), columns=[f"{c}_l", f"{c}_m", f"{c}_u"])
+        fuzzy_parts.append(fuzzy_df)
+    return pd.concat(fuzzy_parts, axis=1)
+
+def defuzzify(fuzzy_df):
+    vals = {}
     for c in CRIT_KEYS:
-        if criteria[c]["type"] == "benefit":
-            norm[c] = dfX[c] / dfX[c].max()
-        else: # cost
-            norm[c] = dfX[c].min() / dfX[c]
+        l = fuzzy_df[f"{c}_l"]
+        m = fuzzy_df[f"{c}_m"]
+        u = fuzzy_df[f"{c}_u"]
+        centroid = (l + m + u) / 3.0
+        vals[c] = centroid
+    return pd.DataFrame(vals)
 
-    # bobot
-    W = pd.Series(st.session_state.weights)
 
-    weighted = norm * W
+# ==============================================
+# SAW CALC
+# ==============================================
 
+def saw_normalize(X):
+    norm = X.copy().astype(float)
+    maxv = X.max()
+    minv = X.min()
+
+    for c in CRIT_KEYS:
+        if CRITERIA[c]["type"] == "benefit":
+            norm[c] = X[c] / maxv[c]
+        else:
+            norm[c] = minv[c] / X[c]
+
+    return norm
+
+def saw_full(X, weights):
+    norm = saw_normalize(X)
+    w = pd.Series(weights)
+    weighted = norm * w
     score = weighted.sum(axis=1)
-    rank = score.rank(ascending=False, method="min")
+    rank = score.rank(ascending=False, method="min").astype(int)
 
-    result = pd.DataFrame({
-        "kode": df["kode"],
-        "nama": df["nama"],
-        "score": score,
-        "rank": rank
-    })
-
-    return dfX, norm, weighted, result
+    result = pd.DataFrame({"score": score, "rank": rank})
+    return {
+        "normalized": norm,
+        "weighted": weighted,
+        "result": result
+    }
 
 
-# ---------------------------------------------------------
-# FUNGSI WP
-# ---------------------------------------------------------
-def calc_wp(df, criteria):
-    dfX = df[CRIT_KEYS].astype(float)
-    W = np.array([st.session_state.weights[c] for c in CRIT_KEYS])
+# ==============================================
+# WP CALC
+# ==============================================
 
-    # exponent: cost → negative
-    W_exp = W.copy()
-    for i,c in enumerate(CRIT_KEYS):
-        if criteria[c]["type"] == "cost":
-            W_exp[i] *= -1
+def wp_full(X, weights):
+    w = pd.Series(weights)
+    exp = w.copy()
 
-    # hitung S
-    S = []
-    for _, row in dfX.iterrows():
-        val = np.prod(row.values ** W_exp)
-        S.append(val)
+    for c in CRIT_KEYS:
+        if CRITERIA[c]["type"] == "cost":
+            exp[c] = -abs(w[c])
 
-    S = np.array(S)
+    eps = 1e-9
+    X_safe = X.clip(lower=eps)
+    S = X_safe.pow(exp).prod(axis=1)
     V = S / S.sum()
+    rank = V.rank(ascending=False, method="min").astype(int)
 
-    result = pd.DataFrame({
-        "kode": df["kode"],
-        "nama": df["nama"],
-        "S": S,
-        "V": V,
-        "rank": pd.Series(V).rank(ascending=False, method="min")
-    })
-
-    return dfX, W_exp, result
+    result = pd.DataFrame({"S": S, "V": V, "rank": rank})
+    return {"exp": exp, "result": result}
 
 
-# ---------------------------------------------------------
-# PAGE 1 – HOME
-# ---------------------------------------------------------
+# ==============================================
+# SIDEBAR NAVIGATION
+# ==============================================
+
+st.sidebar.header("Menu")
+page = st.sidebar.radio("Pilih halaman", [
+    "Home", "Perhitungan", "SAW", "WP", "Pembanding", "Tentang"
+])
+
+use_fuzzy = st.sidebar.checkbox("Gunakan Fuzzy", value=False)
+
+
+
+# ==============================================
+# PAGE: HOME
+# ==============================================
+
 if page == "Home":
-    st.header("Informasi Sistem")
-    st.write("""
-    Sistem ini menggunakan metode **SAW** dan **Weighted Product (WP)**  
-    untuk menentukan peringkat alternatif berdasarkan beberapa kriteria.
-    """)
+    st.header("Home – Informasi Sistem")
+    st.write("Aplikasi mendukung Fuzzy → SAW → WP → Pembanding")
 
-    st.subheader("Kriteria yang digunakan")
-    crit_table = pd.DataFrame({
-        c:[CRITERIA[c]["name"], CRITERIA[c]["type"], CRITERIA[c]["weight"]]
-        for c in CRITERIA
-    }, index=["Nama","Tipe","Bobot Default"])
-    st.table(crit_table.T)
+    st.subheader("Data Awal Alternatif")
+    st.dataframe(st.session_state.df)
 
-    st.subheader("Data Awal")
-    st.dataframe(DEFAULT_DATA)
+    st.subheader("Kriteria & Bobot Default")
+    st.table(pd.DataFrame({
+        c: {"Nama": CRITERIA[c]["name"],
+            "Tipe": CRITERIA[c]["type"],
+            "Bobot": CRITERIA[c]["weight"]}
+    }).T)
 
 
-# ---------------------------------------------------------
-# PAGE 2 – INPUT DATA
-# ---------------------------------------------------------
-elif page == "Input Data":
-    st.header("Edit / Tambah Alternatif")
-    st.info("Anda dapat menambah atau mengedit alternatif di tabel berikut.")
+# ==============================================
+# PAGE: PERHITUNGAN (EDIT DATA + RUN)
+# ==============================================
 
-    edited = st.data_editor(st.session_state.df, num_rows="dynamic")
+elif page == "Perhitungan":
+    st.header("Perhitungan – Edit Data & Jalankan")
+
+    st.write("Ubah nilai alternatif:")
+    edited = st.experimental_data_editor(st.session_state.df, num_rows="dynamic")
     st.session_state.df = edited
 
-    st.download_button(
-        "Download data (.csv)", 
-        edited.to_csv(index=False).encode('utf-8'),
-        file_name="data_alternatif.csv"
-    )
+    # EDIT BOBOT
+    st.subheader("Edit Bobot Kriteria")
+    new_weights = {}
+    for c in CRITERIA:
+        new_weights[c] = st.number_input(
+            f"{c} - {CRITERIA[c]['name']}",
+            0.0, 1.0,
+            st.session_state.weights[c]
+        )
+
+    if st.button("Simpan Bobot"):
+        s = sum(new_weights.values())
+        st.session_state.weights = {k: v/s for k,v in new_weights.items()}
+        st.success("Bobot berhasil dinormalisasi & disimpan!")
+
+    if st.button("Hitung SAW & WP"):
+        df_used = st.session_state.df.copy()
+
+        # FUZZY?
+        if use_fuzzy:
+            fuzzy_df = fuzzify_dataframe(df_used)
+            df_defuzz = defuzzify(fuzzy_df)
+            for c in CRIT_KEYS:
+                df_used[c] = df_defuzz[c]
+
+        saw_res = saw_full(df_used[CRIT_KEYS], st.session_state.weights)
+        wp_res = wp_full(df_used[CRIT_KEYS], st.session_state.weights)
+
+        st.session_state.last_results = {
+            "df_used": df_used.copy(),
+            "saw": saw_res,
+            "wp": wp_res
+        }
+
+        st.success("Perhitungan selesai! Lihat menu SAW, WP atau Pembanding.")
 
 
-# ---------------------------------------------------------
-# PAGE 3 – SAW
-# ---------------------------------------------------------
+# ==============================================
+# PAGE: SAW DETAIL
+# ==============================================
+
 elif page == "SAW":
-    st.header("Perhitungan Metode SAW")
-
-    df = st.session_state.df.copy()
-
-    with st.spinner("Menghitung SAW..."):
-        time.sleep(0.3)
-        raw, norm, weighted, result = calc_saw(df, CRITERIA)
-
-    st.subheader("1. Matriks Awal (X)")
-    st.dataframe(raw)
-
-    st.subheader("2. Normalisasi")
-    st.dataframe(norm.style.format("{:.6f}"))
-
-    st.subheader("3. Perkalian Bobot")
-    st.dataframe(weighted.style.format("{:.6f}"))
-
-    st.subheader("4. Hasil SAW (Score & Rank)")
-    st.dataframe(result.sort_values("rank"))
-
-    buf = BytesIO()
-    result.to_excel(buf, index=False, engine="openpyxl")
-    buf.seek(0)
-    st.download_button("Download Hasil SAW (.xlsx)", buf, "hasil_saw.xlsx")
-
-
-# ---------------------------------------------------------
-# PAGE 4 – WP
-# ---------------------------------------------------------
-elif page == "WP":
-    st.header("Perhitungan Metode Weighted Product (WP)")
-
-    df = st.session_state.df.copy()
-
-    with st.spinner("Menghitung WP..."):
-        time.sleep(0.3)
-        raw, W_exp, result = calc_wp(df, CRITERIA)
-
-    st.subheader("1. Matriks Awal (X)")
-    st.dataframe(raw)
-
-    st.subheader("2. Bobot Berpangkat (cost → negatif)")
-    Wexp_df = pd.DataFrame([W_exp], columns=CRIT_KEYS)
-    st.dataframe(Wexp_df)
-
-    st.subheader("3. Hasil WP (S, V, Rank)")
-    st.dataframe(result.sort_values("rank"))
-
-    buf = BytesIO()
-    result.to_excel(buf, index=False, engine="openpyxl")
-    buf.seek(0)
-    st.download_button("Download Hasil WP (.xlsx)", buf, "hasil_wp.xlsx")
-
-
-# ---------------------------------------------------------
-# PAGE 5 – PERBANDINGAN
-# ---------------------------------------------------------
-elif page == "Perbandingan":
-    st.header("Perbandingan SAW vs WP")
-
-    df = st.session_state.df.copy()
-
-    raw_saw, norm, weighted, res_saw = calc_saw(df, CRITERIA)
-    raw_wp, Wexp, res_wp = calc_wp(df, CRITERIA)
-
-    comp = pd.DataFrame({
-        "Alternatif": df["nama"],
-        "SAW Score": res_saw["score"].values,
-        "WP Score": res_wp["V"].values,
-    })
-
-    st.dataframe(comp)
-
-    top_saw = res_saw.loc[res_saw["rank"].idxmin(), "nama"]
-    top_wp = res_wp.loc[res_wp["rank"].idxmin(), "nama"]
-
-    st.subheader("Kesimpulan")
-
-    if top_saw == top_wp:
-        st.success(f"Kedua metode memilih **{top_saw}** sebagai alternatif terbaik.")
+    if not st.session_state.last_results:
+        st.warning("Belum ada hasil. Jalankan Perhitungan dulu.")
     else:
-        st.info(f"SAW memilih **{top_saw}**, sedangkan WP memilih **{top_wp}**.")
+        st.header("Detail Perhitungan SAW")
+        saw = st.session_state.last_results["saw"]
+        df_used = st.session_state.last_results["df_used"]
+
+        st.subheader("Normalisasi")
+        st.dataframe(saw["normalized"].style.format("{:.6f}"))
+
+        st.subheader("Bobot × Normalisasi")
+        st.dataframe(saw["weighted"].style.format("{:.6f}"))
+
+        st.subheader("Skor & Ranking")
+        st.dataframe(saw["result"].sort_values("rank"))
 
 
-# ---------------------------------------------------------
-# PAGE 6 – TENTANG
-# ---------------------------------------------------------
+# ==============================================
+# PAGE: WP DETAIL
+# ==============================================
+
+elif page == "WP":
+    if not st.session_state.last_results:
+        st.warning("Belum ada hasil. Jalankan Perhitungan dulu.")
+    else:
+        st.header("Detail Perhitungan WP")
+        wp = st.session_state.last_results["wp"]
+        df_used = st.session_state.last_results["df_used"]
+
+        st.subheader("Bobot Berpangkat")
+        st.dataframe(wp["exp"].to_frame("exponent"))
+
+        st.subheader("S, V, Rank")
+        st.dataframe(wp["result"].sort_values("rank"))
+
+
+# ==============================================
+# PAGE: PEMBANDING
+# ==============================================
+
+elif page == "Pembanding":
+    if not st.session_state.last_results:
+        st.warning("Belum ada hasil!")
+    else:
+        st.header("Pembanding SAW vs WP")
+
+        saw = st.session_state.last_results["saw"]["result"]
+        wp = st.session_state.last_results["wp"]["result"]
+        df_used = st.session_state.last_results["df_used"]
+
+        comp = pd.DataFrame({
+            "nama": df_used["nama"],
+            "score_saw": saw["score"].values,
+            "rank_saw": saw["rank"].values,
+            "score_wp": wp["V"].values,
+            "rank_wp": wp["rank"].values,
+        })
+
+        st.dataframe(comp)
+
+        best_saw = comp.loc[comp["rank_saw"].idxmin(), "nama"]
+        best_wp = comp.loc[comp["rank_wp"].idxmin(), "nama"]
+
+        if best_saw == best_wp:
+            st.success(f"Kedua metode sepakat: **{best_saw}**")
+        else:
+            st.error(f"Metode berbeda → SAW memilih **{best_saw}**, WP memilih **{best_wp}**")
+
+
+# ==============================================
+# PAGE: TENTANG
+# ==============================================
+
 elif page == "Tentang":
     st.header("Tentang Sistem")
     st.write("""
-    Sistem ini dibangun menggunakan:
-    - **Metode SAW (Simple Additive Weighting)**
-    - **Metode WP (Weighted Product)**
-    - **Streamlit** sebagai antarmuka interaktif.
+        Sistem keputusan ini menggabungkan:
+        - Logika Fuzzy (Triangular → Centroid)
+        - SAW (Simple Additive Weighting)
+        - WP (Weighted Product)
+
+        Semua perhitungan dapat ditampilkan lengkap:
+        - Normalisasi SAW
+        - Weighted Matrix
+        - Ranking
+        - Exponent WP
+        - Skor S & V
+        - Pembandingan hasil SAW & WP
     """)
 
